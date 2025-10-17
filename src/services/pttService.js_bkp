@@ -1,0 +1,422 @@
+// src/services/pttService.js - VERSIÓN FINAL ANDROID ZEBRA
+import * as Notifications from 'expo-notifications';
+
+let notificationId = null;
+import * as FileSystem from 'expo-file-system';
+import { Audio } from 'expo-av';
+import { Vibration } from 'react-native';
+import { io } from 'socket.io-client';
+
+// ========================================
+// CONFIGURACIÓN
+// ========================================
+
+const PTT_SERVER_URL = 'https://ptt.suppcenter.global:3001';
+const SAMPLE_RATE = 16000;
+
+let socket = null;
+let recording = null;
+let sound = null;
+let isRecording = false;
+let listeners = [];
+let activeUsers = [];
+let currentSpeaker = null;
+
+// ========================================
+// INICIALIZACIÓN
+// ========================================
+
+export const initializePTT = async (user) => {
+  try {
+    console.log('🎙️ Inicializando PTT...');
+    
+    // Permisos de audio
+    const { status } = await Audio.requestPermissionsAsync();
+    if (status !== 'granted') {
+      return { success: false, message: 'Permisos denegados' };
+    }
+    console.log('✅ Permisos OK');
+    
+    await Audio.setAudioModeAsync({
+      staysActiveInBackground: true,
+      shouldDuckAndroid: true,
+      playThroughEarpieceAndroid: false,
+    });
+    
+    // ✅ NOTIFICACIÓN PERSISTENTE
+    try {
+      await Notifications.setNotificationChannelAsync('ptt-service', {
+        name: 'PTT Service',
+        importance: Notifications.AndroidImportance.LOW,
+        sound: false,
+        vibrationPattern: [0],
+      });
+      
+      notificationId = await Notifications.scheduleNotificationAsync({
+        content: {
+          title: '🎙️ PTT Activo',
+          body: 'Walkie-Talkie conectado',
+          sticky: true,
+        },
+        trigger: null,
+      });
+      
+      console.log('📱 Notificación creada');
+    } catch (e) {
+      console.log('⚠️ Error notificación:', e.message);
+    }
+    
+    // ✅ SOCKET CON KEEP-ALIVE AGRESIVO
+    socket = io(PTT_SERVER_URL, {
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 20000,
+      
+      // ✅ CRÍTICO: PING/PONG MÁS FRECUENTE
+      pingInterval: 5000,  // Ping cada 5 segundos
+      pingTimeout: 10000,  // Timeout de 10 segundos
+      
+      // ✅ UPGRADE A WEBSOCKET INMEDIATAMENTE
+      upgrade: true,
+      rememberUpgrade: true,
+      transports: ['websocket'],
+    });
+    
+    // ✅ KEEP-ALIVE MANUAL (POR SI ACASO)
+    let keepAliveInterval;
+    
+    socket.on('connect', () => {
+      console.log('✅ PTT conectado:', socket.id);
+      
+      const channelId = `tenant_${user.tenant_id}_client_${user.client_id}`;
+      socket.emit('join_channel', {
+        userId: user.car_user_id || user.user_id,
+        userName: user.name || `${user.first_name} ${user.last_name}`,
+        tenantId: user.tenant_id,
+        clientId: user.client_id,
+        channelId
+      });
+      
+      // ✅ PING MANUAL CADA 3 SEGUNDOS
+      if (keepAliveInterval) clearInterval(keepAliveInterval);
+      keepAliveInterval = setInterval(() => {
+        if (socket && socket.connected) {
+          socket.emit('ping', { timestamp: Date.now() });
+        }
+      }, 3000);
+      
+      notifyListeners('connected');
+    });
+    
+    socket.on('pong', (data) => {
+      // Respuesta del servidor - conexión viva
+    });
+    
+    socket.on('connect_error', (error) => {
+      console.log('❌ Error conexión:', error.message);
+    });
+    
+    socket.on('disconnect', (reason) => {
+      console.log('🔌 Desconectado:', reason);
+      
+      if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+      }
+      
+      if (reason === 'io server disconnect') {
+        socket.connect();
+      }
+      
+      notifyListeners('disconnected');
+    });
+    
+    socket.on('reconnect', (attemptNumber) => {
+      console.log('🔄 Reconectado:', attemptNumber);
+    });
+    
+    socket.on('audio_receive', async (data) => {
+      console.log('🔊 Audio recibido');
+      await playAudio(data.audioData);
+    });
+    
+    socket.on('user_speaking', (data) => {
+      currentSpeaker = data.speaking ? data.userName : null;
+      notifyListeners('speaker_changed', currentSpeaker);
+      if (data.speaking) Vibration.vibrate(100);
+    });
+    
+    socket.on('active_users', (users) => {
+      activeUsers = users;
+      notifyListeners('users_updated', users);
+    });
+    
+    socket.on('user_joined', (data) => {
+      console.log(`👤 ${data.userName} se unió`);
+      notifyListeners('user_joined', data);
+    });
+    
+    socket.on('user_left', (data) => {
+      console.log(`👋 ${data.userName} salió`);
+      notifyListeners('user_left', data);
+    });
+    
+    return { success: true, message: 'PTT OK' };
+    
+  } catch (error) {
+    console.error('❌ Error init:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+// ========================================
+// GRABAR AUDIO
+// ========================================
+
+export const startRecording = async (user) => {
+  if (isRecording) {
+    console.log('⚠️ Ya está grabando');
+    return { success: false };
+  }
+  
+  try {
+    console.log('🔴 INICIANDO GRABACIÓN PTT...');
+    
+    // ✅ MARCAR COMO GRABANDO INMEDIATAMENTE
+    isRecording = true;
+    notifyListeners('recording_started');
+    
+    // Notificar al servidor
+    socket?.emit('ptt_pressed', {
+      userId: user.car_user_id || user.user_id,
+      userName: user.name || `${user.first_name} ${user.last_name}`
+    });
+    
+    Vibration.vibrate(200);
+    
+    // Crear recording
+    recording = new Audio.Recording();
+    console.log('📱 Recording creado');
+    
+    // ✅ USAR VALORES NUMÉRICOS DIRECTOS (MÁS CONFIABLE)
+    await recording.prepareToRecordAsync({
+      android: {
+        extension: '.m4a',
+        outputFormat: 2,  // MPEG_4
+        audioEncoder: 3,  // AAC
+        sampleRate: SAMPLE_RATE,
+        numberOfChannels: 1,
+        bitRate: 32000,
+      },
+      ios: {
+        extension: '.m4a',
+        outputFormat: 1,  // MPEG4AAC
+        audioQuality: 0,  // LOW
+        sampleRate: SAMPLE_RATE,
+        numberOfChannels: 1,
+        bitRate: 32000,
+      },
+    });
+    console.log('📱 Recording preparado');
+    
+    await recording.startAsync();
+    console.log('✅ GRABACIÓN ACTIVA');
+    
+    return { success: true };
+    
+  } catch (error) {
+    console.error('❌ ERROR INICIANDO GRABACIÓN:', error);
+    console.error('❌ Error details:', JSON.stringify(error));
+    
+    // Resetear estado si falla
+    isRecording = false;
+    recording = null;
+    notifyListeners('recording_error');
+    
+    return { success: false, error: error.message };
+  }
+};
+
+// ========================================
+// DETENER GRABACIÓN
+// ========================================
+
+export const stopRecording = async (user) => {
+  if (!isRecording || !recording) {
+    console.log('⚠️ No hay grabación activa');
+    return { success: false };
+  }
+  
+  try {
+    console.log('⚪ DETENIENDO GRABACIÓN PTT...');
+    
+    await recording.stopAndUnloadAsync();
+    const uri = recording.getURI();
+    console.log('📁 URI del audio:', uri);
+    
+    isRecording = false;
+    recording = null;
+    
+    socket?.emit('ptt_released', {
+      userId: user.car_user_id || user.user_id,
+      userName: user.name || `${user.first_name} ${user.last_name}`
+    });
+    
+    Vibration.vibrate(100);
+    notifyListeners('recording_stopped');
+    
+    // Enviar audio al servidor
+    if (uri) {
+      try {
+        console.log('📤 Procesando audio...');
+        
+        const response = await fetch(uri);
+        const blob = await response.blob();
+        
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        
+        reader.onloadend = () => {
+          const base64Audio = reader.result.split(',')[1];
+          
+          if (base64Audio && socket?.connected) {
+            socket.emit('audio_stream', {
+              audioData: base64Audio,
+              userId: user.car_user_id || user.user_id,
+              userName: user.name || `${user.first_name} ${user.last_name}`,
+              timestamp: Date.now()
+            });
+            
+            console.log('✅ Audio enviado al servidor:', (base64Audio.length / 1024).toFixed(2), 'KB');
+          } else {
+            console.log('⚠️ No se pudo enviar audio o socket desconectado');
+          }
+        };
+        
+        reader.onerror = (error) => {
+          console.error('❌ Error leyendo archivo de audio:', error);
+        };
+        
+      } catch (e) {
+        console.error('❌ Error procesando audio:', e);
+      }
+    }
+    
+    return { success: true };
+    
+  } catch (error) {
+    console.error('❌ Error deteniendo grabación:', error);
+    isRecording = false;
+    recording = null;
+    notifyListeners('recording_stopped');
+    return { success: false, error: error.message };
+  }
+};
+
+// ========================================
+// REPRODUCIR AUDIO RECIBIDO
+// ========================================
+
+const playAudio = async (base64Audio) => {
+  try {
+    console.log('🔊 Reproduciendo audio recibido...');
+    
+    if (sound) {
+      await sound.unloadAsync();
+      sound = null;
+    }
+    
+    // ✅ CONVERTIR BASE64 A BLOB (MÉTODO QUE SÍ FUNCIONA EN RN)
+    const byteCharacters = atob(base64Audio);
+    const byteNumbers = new Array(byteCharacters.length);
+    
+    for (let i = 0; i < byteCharacters.length; i++) {
+      byteNumbers[i] = byteCharacters.charCodeAt(i);
+    }
+    
+    const byteArray = new Uint8Array(byteNumbers);
+    
+    // ✅ CREAR DATA URI DIRECTAMENTE
+    const dataUri = `data:audio/m4a;base64,${base64Audio}`;
+    
+    console.log('🎵 Creando sonido desde data URI...');
+    
+    // Reproducir desde data URI
+    const { sound: newSound } = await Audio.Sound.createAsync(
+      { uri: dataUri },
+      { shouldPlay: true, volume: 1.0 }
+    );
+    
+    sound = newSound;
+    
+    sound.setOnPlaybackStatusUpdate((status) => {
+      if (status.didJustFinish) {
+        console.log('✅ Reproducción finalizada');
+        sound.unloadAsync();
+        sound = null;
+      }
+    });
+    
+    console.log('✅ Audio reproduciendo correctamente');
+    
+  } catch (error) {
+    console.error('❌ Error reproduciendo audio:', error.message);
+  }
+};
+
+// ========================================
+// UTILIDADES
+// ========================================
+
+export const subscribe = (callback) => {
+  listeners.push(callback);
+  return () => {
+    listeners = listeners.filter(cb => cb !== callback);
+  };
+};
+
+const notifyListeners = (event, data = null) => {
+  listeners.forEach(callback => {
+    try {
+      callback({ event, data });
+    } catch (error) {
+      console.error('Error en listener PTT:', error);
+    }
+  });
+};
+
+export const getActiveUsers = () => activeUsers;
+export const getCurrentSpeaker = () => currentSpeaker;
+export const isConnected = () => socket?.connected || false;
+
+export const disconnectPTT = async () => {
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
+  
+  if (recording) {
+    await recording.stopAndUnloadAsync();
+    recording = null;
+  }
+  
+  if (sound) {
+    await sound.unloadAsync();
+    sound = null;
+  }
+  
+  // ✅ LIMPIAR NOTIFICACIÓN
+  if (notificationId) {
+    await Notifications.dismissNotificationAsync(notificationId);
+    notificationId = null;
+  }
+  
+  isRecording = false;
+  listeners = [];
+  activeUsers = [];
+  currentSpeaker = null;
+  
+  console.log('🔌 PTT desconectado completamente');
+};

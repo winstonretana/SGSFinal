@@ -1,0 +1,87 @@
+// src/utils/storage.js
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// Guardar datos en el teléfono
+export const saveData = async (key, value) => {
+  try {
+    const jsonValue = JSON.stringify(value);
+    await AsyncStorage.setItem(key, jsonValue);
+    return true;
+  } catch (error) {
+    console.error('Error guardando datos:', error);
+    return false;
+  }
+};
+
+// Leer datos del teléfono
+export const getData = async (key) => {
+  try {
+    const jsonValue = await AsyncStorage.getItem(key);
+    return jsonValue != null ? JSON.parse(jsonValue) : null;
+  } catch (error) {
+    console.error('Error leyendo datos:', error);
+    return null;
+  }
+};
+
+// Eliminar datos
+export const removeData = async (key) => {
+  try {
+    await AsyncStorage.removeItem(key);
+    return true;
+  } catch (error) {
+    console.error('Error eliminando datos:', error);
+    return false;
+  }
+};
+
+// Limpiar todo el storage
+export const clearAll = async () => {
+  try {
+    await AsyncStorage.clear();
+    return true;
+  } catch (error) {
+    console.error('Error limpiando storage:', error);
+    return false;
+  }
+};
+
+// Obtener todas las claves
+export const getAllKeys = async () => {
+  try {
+    return await AsyncStorage.getAllKeys();
+  } catch (error) {
+    console.error('Error obteniendo claves:', error);
+    return [];
+  }
+};
+
+// ✅ Claves para guardar información - COMPLETO CON ROUNDS
+export const STORAGE_KEYS = {
+  // Autenticación y Usuario
+  USER: 'user_data',
+  TOKEN: 'auth_token',
+  
+  // Attendance (Asistencia)
+  PENDING_MARKS: 'pending_marks',
+  LAST_SYNC: 'last_sync',
+  LAST_ACTION: 'last_action',
+  
+  // Zonas (Compartido)
+  ZONES: 'zones_cache',
+  ZONES_LAST_UPDATE: 'zones_last_update',
+  
+  // Sentinel (GPS Tracking)
+  PENDING_GPS: 'pending_gps_positions',
+  LAST_GPS_POSITION: 'last_gps_position',
+  GPS_TRACKING_ACTIVE: 'gps_tracking_active',
+  GPS_SETTINGS: 'gps_settings',
+  
+  // ✅ ROUNDS (Rondas) - NUEVAS KEYS
+  ROUNDS_ASSIGNMENTS: 'rounds_assignments',
+  ACTIVE_ROUND: 'active_round',
+  ROUND_CHECKPOINTS: 'round_checkpoints',
+  
+  // Modo Offline
+  OFFLINE_MODE: 'offline_mode'
+};

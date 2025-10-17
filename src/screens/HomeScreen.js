@@ -1,0 +1,678 @@
+// src/screens/HomeScreen.js - VERSIÓN COMPLETA CON HEARTBEAT
+import React, { useState, useEffect } from 'react';
+import { View, Text, TouchableOpacity, StyleSheet, Alert, SafeAreaView, StatusBar, ScrollView, RefreshControl } from 'react-native';
+import { MaterialIcons, Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
+import { sendPanicAlert } from '../services/attendanceService';
+import { getData, STORAGE_KEYS } from '../utils/storage';
+import { logout } from '../services/authService';
+import { syncAll, getPendingCount, cleanOldPendingData } from '../utils/sync';
+import { startHeartbeat, stopHeartbeat, subscribe } from '../services/heartbeatService'; // ✅ HEARTBEAT
+
+export default function HomeScreen({ route, navigation }) {
+  const { user } = route.params || {};
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastAction, setLastAction] = useState(null);
+  const [pendingCount, setPendingCount] = useState({ attendance: 0, gps: 0, rounds: 0, total: 0 });
+  const [syncing, setSyncing] = useState(false);
+  const [gpsStats, setGpsStats] = useState(null);
+  const [isOnline, setIsOnline] = useState(true); // ✅ ESTADO DE CONEXIÓN
+
+  useEffect(() => {
+    loadLastAction();
+    checkPendingData();
+    
+    // ✅ INICIAR HEARTBEAT
+    console.log('🚀 Iniciando heartbeat...');
+    startHeartbeat();
+    
+    // ✅ SUSCRIBIRSE A EVENTOS
+    const unsubscribe = subscribe((update) => {
+      console.log('💓 Heartbeat event:', update);
+      setIsOnline(update.isOnline);
+      
+      if (update.event === 'synced' && update.data?.totalSynced > 0) {
+        checkPendingData();
+      }
+    });
+    
+    // Iniciar GPS si tiene permisos
+    if (user.access?.hasSentinel) {
+      setTimeout(async () => {
+        try {
+          const { startGPSTracking } = await import('../services/sentinelService');
+          await startGPSTracking();
+          setTimeout(() => {
+            checkGPSStatus();
+          }, 500);
+        } catch (error) {
+          // Silencioso
+        }
+      }, 1000);
+    }
+    
+    // Limpiar datos antiguos
+    cleanOldPendingData();
+
+    // ✅ CLEANUP
+    return () => {
+      stopHeartbeat();
+      unsubscribe();
+    };
+  }, []);
+
+  const loadLastAction = async () => {
+    const action = await getData(STORAGE_KEYS.LAST_ACTION);
+    setLastAction(action);
+  };
+
+  const checkPendingData = async () => {
+    const counts = await getPendingCount();
+    setPendingCount(counts);
+  };
+
+  const checkGPSStatus = async () => {
+    try {
+      if (user.access?.hasSentinel) {
+        const { getTrackingStats } = await import('../services/sentinelService');
+        const stats = await getTrackingStats();
+        setGpsStats(stats);
+      }
+    } catch (error) {
+      // Silencioso
+    }
+  };
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await loadLastAction();
+    await checkPendingData();
+    await checkGPSStatus();
+    
+    try {
+      const result = await syncAll();
+      if (result.totalSynced > 0) {
+        console.log(`✅ Pull refresh: ${result.totalSynced} items sincronizados`);
+      }
+    } catch (error) {
+      console.log('Error en sync:', error);
+    }
+    
+    setRefreshing(false);
+  };
+
+  const handleManualSync = async () => {
+    if (syncing) return;
+    
+    setSyncing(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    
+    try {
+      const result = await syncAll();
+      
+      if (result.success && result.totalSynced > 0) {
+        const details = [];
+        if (result.attendance.synced > 0) details.push(`${result.attendance.synced} marca${result.attendance.synced !== 1 ? 's' : ''}`);
+        if (result.gps.synced > 0) details.push(`${result.gps.synced} posición${result.gps.synced !== 1 ? 'es' : ''} GPS`);
+        if (result.rounds.synced > 0) details.push(`${result.rounds.synced} checkpoint${result.rounds.synced !== 1 ? 's' : ''}`);
+        
+        Alert.alert(
+          '✅ Sincronización Exitosa',
+          `Se sincronizaron:\n\n${details.join('\n')}`,
+          [{ text: 'OK', onPress: () => checkPendingData() }]
+        );
+      } else if (result.totalFailed > 0) {
+        const pending = [];
+        if (result.attendance.failed > 0) pending.push(`${result.attendance.failed} marca${result.attendance.failed !== 1 ? 's' : ''}`);
+        if (result.gps.failed > 0) pending.push(`${result.gps.failed} posición${result.gps.failed !== 1 ? 'es' : ''} GPS`);
+        if (result.rounds.failed > 0) pending.push(`${result.rounds.failed} checkpoint${result.rounds.failed !== 1 ? 's' : ''}`);
+        
+        Alert.alert(
+          '⚠️ Sincronización Parcial',
+          result.totalSynced > 0 
+            ? `Sincronizados: ${result.totalSynced}\n\nAún pendientes:\n${pending.join('\n')}\n\nSe reintentarán automáticamente.`
+            : `Elementos pendientes:\n${pending.join('\n')}\n\nSe reintentarán cuando mejore la conexión.`,
+          [{ text: 'OK', onPress: () => checkPendingData() }]
+        );
+      } else if (!result.success) {
+        Alert.alert(
+          '❌ Sin Conexión',
+          'No se pudo conectar al servidor. Verifica tu conexión a internet.',
+          [{ text: 'OK' }]
+        );
+      } else {
+        Alert.alert('ℹ️ Info', 'No hay elementos pendientes para sincronizar', [{ text: 'OK' }]);
+      }
+      
+      await checkPendingData();
+      
+    } catch (error) {
+      console.error('Error en sync manual:', error);
+      Alert.alert('❌ Error', 'Error al sincronizar. Intenta nuevamente.', [{ text: 'OK' }]);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handlePanic = async () => {
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+    
+    Alert.alert(
+      '🚨 ALERTA DE PÁNICO',
+      '¿Confirmas que deseas enviar una alerta de emergencia?',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        { 
+          text: '🚨 ENVIAR ALERTA', 
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+              
+              const result = await sendPanicAlert(
+                user.car_user_id || user.user_id,
+                user.tenant_id || 1,
+                user.client_id
+              );
+              
+              if (result.success) {
+                Alert.alert('✅ Alerta Enviada', 'La alerta de pánico ha sido registrada', [{ text: 'OK' }]);
+              } else {
+                Alert.alert('Error', result.message || 'No se pudo enviar la alerta', [{ text: 'OK' }]);
+              }
+            } catch (error) {
+              Alert.alert('Error', 'Error al enviar alerta de pánico', [{ text: 'OK' }]);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const handleLogout = () => {
+    Alert.alert(
+      'Cerrar Sesión',
+      '¿Estás seguro de que deseas salir?',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        { 
+          text: 'Salir', 
+          style: 'destructive',
+          onPress: async () => {
+            // ✅ DETENER HEARTBEAT
+            stopHeartbeat();
+            
+            if (user.access?.hasSentinel) {
+              try {
+                const { stopGPSTracking } = await import('../services/sentinelService');
+                await stopGPSTracking();
+              } catch (error) {
+                console.log('Error deteniendo GPS:', error);
+              }
+            }
+            
+            await logout();
+            navigation.replace('Login');
+          }
+        }
+      ]
+    );
+  };
+
+  // ✅ FUNCIÓN PARA STATUS (solo Attendance)
+  const getStatusInfo = () => {
+    if (!lastAction) {
+      return { 
+        icon: 'help-circle', 
+        text: 'SIN ESTADO', 
+        color: '#94A3B8', 
+        bgColor: '#F1F5F9' 
+      };
+    }
+
+    switch (lastAction.type) {
+      case 'IN': 
+        return { 
+          icon: 'checkmark-circle', 
+          text: 'TRABAJANDO', 
+          color: '#10B981', 
+          bgColor: '#D1FAE5' 
+        };
+      case 'OUT': 
+        return { 
+          icon: 'close-circle', 
+          text: 'FUERA', 
+          color: '#EF4444', 
+          bgColor: '#FEE2E2' 
+        };
+      case 'break_start': 
+        return { 
+          icon: 'cafe', 
+          text: 'DESCANSO', 
+          color: '#F59E0B', 
+          bgColor: '#FEF3C7' 
+        };
+      case 'break_end': 
+        return { 
+          icon: 'checkmark-circle', 
+          text: 'TRABAJANDO', 
+          color: '#10B981', 
+          bgColor: '#D1FAE5' 
+        };
+      default: 
+        return { 
+          icon: 'help-circle', 
+          text: 'SIN ESTADO', 
+          color: '#94A3B8', 
+          bgColor: '#F1F5F9' 
+        };
+    }
+  };
+
+  const status = getStatusInfo();
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#1E293B" />
+      
+      <ScrollView 
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#3B82F6" />
+        }
+      >
+        {/* HEADER */}
+        <View style={styles.header}>
+          <MaterialIcons name="person" size={40} color="#FFFFFF" />
+          <Text style={styles.userName}>{user.name || `${user.first_name} ${user.last_name}`}</Text>
+          <Text style={styles.userCode}>#{user.employee_code}</Text>
+          
+          {/* ✅ BADGE DE MÓDULOS */}
+          {user.access && (
+            <View style={[styles.moduleBadge, { backgroundColor: user.access.getModuleColor?.() || '#3B82F6' }]}>
+              <Text style={styles.moduleBadgeText}>
+                {user.access.modules?.join(' • ').toUpperCase() || 'USUARIO'}
+              </Text>
+            </View>
+          )}
+          
+          {/* ✅ INDICADOR DE CONEXIÓN */}
+          <View style={[styles.connectionBadge, !isOnline && styles.connectionBadgeOffline]}>
+            <MaterialIcons 
+              name={isOnline ? "cloud-done" : "cloud-off"} 
+              size={16} 
+              color="#FFFFFF" 
+            />
+            <Text style={styles.connectionText}>
+              {isOnline ? 'En línea' : 'Sin conexión'}
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.content}>
+          {/* ✅ STATUS CARD - Solo Attendance */}
+          {user.access?.hasAttendance && (
+            <View style={[styles.statusCard, { backgroundColor: status.bgColor }]}>
+              <Ionicons name={status.icon} size={64} color={status.color} />
+              <Text style={[styles.statusText, { color: status.color }]}>
+                {status.text}
+              </Text>
+              {lastAction && (
+                <Text style={styles.statusTime}>
+                  {new Date(lastAction.timestamp).toLocaleTimeString('es-CR', { 
+                    hour: '2-digit', 
+                    minute: '2-digit' 
+                  })}
+                </Text>
+              )}
+            </View>
+          )}
+
+          {/* ✅ GPS CARD COMPLETA - Solo Sentinel */}
+          {user.access?.hasSentinel && gpsStats && (
+            <View style={[styles.gpsCard, gpsStats.isActive ? styles.gpsCardActive : styles.gpsCardInactive]}>
+              <MaterialCommunityIcons 
+                name="satellite-variant" 
+                size={24} 
+                color={gpsStats.isActive ? '#10B981' : '#64748B'} 
+              />
+              <View style={styles.gpsInfo}>
+                <Text style={styles.gpsTitle}>
+                  GPS Tracking: {gpsStats.isActive ? 'ACTIVO' : 'INACTIVO'}
+                </Text>
+                {gpsStats.pendingCount > 0 && (
+                  <Text style={styles.gpsPending}>
+                    {gpsStats.pendingCount} posiciones pendientes
+                  </Text>
+                )}
+                {gpsStats.currentInterval && (
+                  <Text style={styles.gpsInterval}>
+                    Intervalo: {gpsStats.currentInterval}
+                  </Text>
+                )}
+              </View>
+            </View>
+          )}
+
+          {/* ✅ PENDING CARD COMPLETA - Con desglose */}
+          {pendingCount.total > 0 && (
+            <View style={styles.pendingCard}>
+              <MaterialIcons name="cloud-upload" size={24} color="#F59E0B" />
+              <View style={styles.pendingInfo}>
+                <Text style={styles.pendingText}>
+                  {pendingCount.total} elemento{pendingCount.total !== 1 ? 's' : ''} pendiente{pendingCount.total !== 1 ? 's' : ''}
+                </Text>
+                {pendingCount.attendance > 0 && (
+                  <Text style={styles.pendingDetail}>
+                    📋 {pendingCount.attendance} marca{pendingCount.attendance !== 1 ? 's' : ''}
+                  </Text>
+                )}
+                {pendingCount.gps > 0 && (
+                  <Text style={styles.pendingDetail}>
+                    📍 {pendingCount.gps} posición{pendingCount.gps !== 1 ? 'es' : ''} GPS
+                  </Text>
+                )}
+                {pendingCount.rounds > 0 && (
+                  <Text style={styles.pendingDetail}>
+                    🗺️ {pendingCount.rounds} checkpoint{pendingCount.rounds !== 1 ? 's' : ''}
+                  </Text>
+                )}
+              </View>
+              <TouchableOpacity 
+                style={styles.syncButton}
+                onPress={handleManualSync}
+                disabled={syncing}
+              >
+                <MaterialIcons name={syncing ? "sync" : "sync"} size={20} color="#FFF" />
+                <Text style={styles.syncButtonText}>
+                  {syncing ? 'Sincronizando...' : 'Sincronizar'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          
+          {/* BOTÓN DE MARCAS */}
+          {user.access?.hasAttendance && (
+            <TouchableOpacity 
+              style={styles.mainButton} 
+              onPress={() => navigation.navigate('Scanner', { user })} 
+              activeOpacity={0.7}
+            >
+              <MaterialCommunityIcons name="qrcode-scan" size={56} color="#FFFFFF" />
+              <Text style={styles.mainButtonText}>MARCAS</Text>
+            </TouchableOpacity>
+          )}
+          
+          {/* BOTÓN DE RONDAS */}
+          {user.access?.hasRounds && (
+            <TouchableOpacity 
+              style={[styles.mainButton, { backgroundColor: '#8B5CF6' }]} 
+              onPress={() => navigation.navigate('Rounds', { user })} 
+              activeOpacity={0.7}
+            >
+              <MaterialCommunityIcons name="map-marker-path" size={56} color="#FFFFFF" />
+              <Text style={styles.mainButtonText}>MIS RONDAS</Text>
+            </TouchableOpacity>
+          )}
+          
+          {/* GRID DE BOTONES */}
+          <View style={styles.grid}>
+            {user.access?.hasAttendance && (
+              <TouchableOpacity 
+                style={styles.gridButton} 
+                onPress={() => navigation.navigate('History', { user })}
+              >
+                <MaterialCommunityIcons name="history" size={40} color="#3B82F6" />
+                <Text style={styles.gridText}>Historial</Text>
+              </TouchableOpacity>
+            )}
+            
+            {/* ✅ WALKIE-TALKIE PTT - NUEVO */}
+            <TouchableOpacity 
+              style={styles.gridButton} 
+              onPress={() => navigation.navigate('PTT', { user })}
+            >
+              <MaterialCommunityIcons name="radio-handheld" size={40} color="#8B5CF6" />
+              <Text style={styles.gridText}>Walkie-Talkie</Text>
+            </TouchableOpacity>
+            
+            {user.access?.isSupervisor && (user.access?.hasAttendance || user.access?.hasRounds) && (
+              <TouchableOpacity 
+                style={styles.gridButton} 
+                onPress={() => navigation.navigate('AdminNFC', { user })}
+              >
+                <MaterialCommunityIcons name="nfc-variant" size={40} color="#F59E0B" />
+                <Text style={styles.gridText}>Admin NFC</Text>
+              </TouchableOpacity>
+            )}
+            
+            {(user.access?.hasAttendance || user.access?.hasRounds || user.access?.hasSentinel) && (
+              <TouchableOpacity 
+                style={[styles.gridButton, styles.panicButton]} 
+                onPress={handlePanic}
+              >
+                <MaterialCommunityIcons name="alert-octagon" size={40} color="#FFFFFF" />
+                <Text style={[styles.gridText, styles.panicText]}>PÁNICO</Text>
+              </TouchableOpacity>
+            )}
+            
+            <TouchableOpacity 
+              style={styles.gridButton} 
+              onPress={handleLogout}
+            >
+              <MaterialIcons name="logout" size={40} color="#EF4444" />
+              <Text style={styles.gridText}>Salir</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0F172A',
+  },
+  scrollContent: {
+    flexGrow: 1,
+  },
+  header: {
+    backgroundColor: '#1E293B',
+    alignItems: 'center',
+    paddingVertical: 32,
+    paddingHorizontal: 20,
+    borderBottomLeftRadius: 24,
+    borderBottomRightRadius: 24,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 10,
+  },
+  userName: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+    marginTop: 12,
+  },
+  userCode: {
+    fontSize: 14,
+    color: '#94A3B8',
+    marginTop: 4,
+  },
+  moduleBadge: {
+    marginTop: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    borderRadius: 12,
+  },
+  moduleBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: 'bold',
+  },
+  connectionBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#10B981',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    marginTop: 12,
+    gap: 6
+  },
+  connectionBadgeOffline: {
+    backgroundColor: '#EF4444',
+  },
+  connectionText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  content: {
+    padding: 20,
+    flex: 1,
+  },
+  statusCard: {
+    alignItems: 'center',
+    paddingVertical: 32,
+    borderRadius: 20,
+    marginBottom: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  statusText: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginTop: 12,
+  },
+  statusTime: {
+    fontSize: 14,
+    color: '#64748B',
+    marginTop: 4,
+  },
+  gpsCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    marginBottom: 20,
+    borderWidth: 1,
+  },
+  gpsCardActive: {
+    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+    borderColor: '#10B981',
+  },
+  gpsCardInactive: {
+    backgroundColor: 'rgba(100, 116, 139, 0.1)',
+    borderColor: '#64748B',
+  },
+  gpsInfo: {
+    marginLeft: 12,
+    flex: 1,
+  },
+  gpsTitle: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  gpsPending: {
+    color: '#94A3B8',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  gpsInterval: {
+    color: '#64748B',
+    fontSize: 11,
+    marginTop: 2,
+  },
+  pendingCard: {
+    flexDirection: 'row',
+    backgroundColor: '#78350F',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#F59E0B',
+    alignItems: 'flex-start',
+  },
+  pendingInfo: {
+    marginLeft: 12,
+    flex: 1,
+  },
+  pendingText: {
+    color: '#FDE047',
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  pendingDetail: {
+    color: '#FEF3C7',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  syncButton: {
+    backgroundColor: '#F59E0B',
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 8,
+    gap: 6,
+    marginLeft: 8,
+  },
+  syncButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  mainButton: {
+    backgroundColor: '#3B82F6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 32,
+    borderRadius: 16,
+    marginBottom: 16,
+  },
+  mainButtonText: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 12,
+  },
+  grid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  gridButton: {
+    backgroundColor: '#1E293B',
+    width: '48%',
+    aspectRatio: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  gridText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: 8,
+  },
+  panicButton: {
+    backgroundColor: '#DC2626',
+    borderColor: '#EF4444',
+  },
+  panicText: {
+    color: '#FFFFFF',
+  },
+});

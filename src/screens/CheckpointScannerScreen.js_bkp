@@ -1,0 +1,607 @@
+// src/screens/CheckpointScannerScreen.js - VERSIÓN FINAL: qr_code y nfc_tag_id
+import React, { useState, useEffect } from 'react';
+import {
+  View, Text, StyleSheet, TouchableOpacity, Alert,
+  SafeAreaView, StatusBar, ActivityIndicator, Platform, Vibration
+} from 'react-native';
+import { CameraView, useCameraPermissions } from 'expo-camera';
+import NfcManager, { NfcTech, Ndef } from 'react-native-nfc-manager';
+import { MaterialIcons, MaterialCommunityIcons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
+import { completeCheckpoint } from '../services/roundsService';
+
+// Normalizar IDs de NFC/QR para comparación
+const normalizeId = (id) => {
+  if (!id) return '';
+  return id.toString()
+    .toUpperCase()
+    .replace(/[:\-\s_]/g, '')
+    .trim();
+};
+
+export default function CheckpointScannerScreen({ route, navigation }) {
+  const { user, assignmentId, checkpoint, userLocation, distance, notes } = route.params || {};
+  
+  const [permission, requestPermission] = useCameraPermissions();
+  const [scanned, setScanned] = useState(false);
+  const [mode, setMode] = useState('qr');
+  const [scanning, setScanning] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [nfcSupported, setNfcSupported] = useState(true);
+
+  useEffect(() => {
+    // Log completo del checkpoint
+    console.log('=== CHECKPOINT RECIBIDO ===');
+    console.log(JSON.stringify(checkpoint, null, 2));
+    console.log('¿Tiene qr_code?:', !!checkpoint.qr_code);
+    console.log('¿Tiene nfc_tag_id?:', !!checkpoint.nfc_tag_id);
+    console.log('========================');
+    
+    initializeNFC();
+    return () => cleanupNFC();
+  }, []);
+
+  const cleanupNFC = async () => {
+    try {
+      await NfcManager.cancelTechnologyRequest();
+    } catch (error) {
+      // Ignorar
+    }
+  };
+
+  const initializeNFC = async () => {
+    try {
+      const supported = await NfcManager.isSupported();
+      setNfcSupported(supported);
+      if (supported) {
+        await NfcManager.start();
+      }
+    } catch (error) {
+      setNfcSupported(false);
+    }
+  };
+
+  const handleQRScanned = ({ data }) => {
+    if (scanned || processing) return;
+    
+    setScanned(true);
+    
+    if (Platform.OS === 'ios') {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } else {
+      Vibration.vibrate(100);
+    }
+    
+    // ✅ USAR qr_code en lugar de zone_code
+    const cleanData = normalizeId(data);
+    const checkpointQR = normalizeId(checkpoint.qr_code || checkpoint.zone_code);
+    
+    console.log('=== QR SCAN DEBUG ===');
+    console.log('QR Escaneado RAW:', data);
+    console.log('QR Normalizado:', cleanData);
+    console.log('Checkpoint qr_code:', checkpoint.qr_code);
+    console.log('Checkpoint zone_code:', checkpoint.zone_code);
+    console.log('QR esperado normalizado:', checkpointQR);
+    console.log('¿Coincide?:', cleanData === checkpointQR);
+    console.log('========================');
+    
+    // Validar
+    if (!checkpoint.qr_code && !checkpoint.zone_code) {
+      Alert.alert(
+        '⚠️ QR No Configurado',
+        'Este checkpoint no tiene código QR configurado',
+        [{ text: 'OK', onPress: () => setScanned(false) }]
+      );
+      return;
+    }
+    
+    if (cleanData === checkpointQR || 
+        cleanData.includes(checkpointQR) || 
+        checkpointQR.includes(cleanData)) {
+      handleCheckpointComplete(data, 'qr');
+    } else {
+      Alert.alert(
+        '❌ Código Incorrecto',
+        `Este QR no corresponde a este checkpoint.\n\nEsperado: ${checkpoint.qr_code || checkpoint.zone_code}\nEscaneado: ${data}`,
+        [{ text: 'Reintentar', onPress: () => setScanned(false) }]
+      );
+    }
+  };
+
+  const readNFC = async () => {
+    if (!nfcSupported) {
+      Alert.alert('NFC No Disponible', 'Este dispositivo no soporta NFC');
+      return;
+    }
+
+    setScanning(true);
+    
+    try {
+      await cleanupNFC();
+      
+      const isZebra = Platform.OS === 'android' && 
+        (Platform.constants?.Manufacturer?.toLowerCase().includes('zebra') ||
+         Platform.constants?.Brand?.toLowerCase().includes('zebra'));
+      
+      const nfcPromise = isZebra ?
+        NfcManager.requestTechnology([NfcTech.Ndef, NfcTech.NfcA, NfcTech.IsoDep], {
+          alertMessage: 'Acerca el tag NFC al lector ZEBRA (parte trasera del dispositivo)'
+        }) :
+        NfcManager.requestTechnology(NfcTech.Ndef, {
+          alertMessage: 'Acerca el tag NFC del checkpoint'
+        });
+      
+      await nfcPromise;
+      
+      const tag = await NfcManager.getTag();
+      
+      if (tag) {
+        if (Platform.OS === 'ios') {
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        } else {
+          Vibration.vibrate([0, 100, 50, 100]);
+        }
+        
+        let tagId = tag.id || '';
+        
+        if (!tagId && tag.ndefMessage?.length > 0) {
+          try {
+            for (let record of tag.ndefMessage) {
+              const payload = Ndef.text.decodePayload(record.payload);
+              if (payload) {
+                tagId = payload;
+                break;
+              }
+            }
+          } catch (e) {
+            console.log('Error NDEF:', e);
+          }
+        }
+        
+        if (!tagId && tag.techData) {
+          tagId = tag.techData.serialNumber || tag.techData.uid || tag.techData.id || '';
+        }
+        
+        if (!tagId) {
+          throw new Error('No se pudo leer el tag');
+        }
+        
+        const normalizedTagId = normalizeId(tagId);
+        const normalizedCheckpointNfc = normalizeId(checkpoint.nfc_tag_id);
+        
+        console.log('=== NFC SCAN DEBUG ===');
+        console.log('NFC Tag RAW:', tagId);
+        console.log('NFC Normalizado:', normalizedTagId);
+        console.log('Checkpoint nfc_tag_id:', checkpoint.nfc_tag_id);
+        console.log('NFC esperado normalizado:', normalizedCheckpointNfc);
+        console.log('¿Coincide?:', normalizedTagId === normalizedCheckpointNfc);
+        console.log('========================');
+        
+        // Verificar que existe nfc_tag_id
+        if (!checkpoint.nfc_tag_id) {
+          Alert.alert(
+            '⚠️ NFC No Configurado',
+            'Este checkpoint no tiene un tag NFC asignado. Usa el código QR en su lugar.',
+            [{ text: 'OK', onPress: () => setScanning(false) }]
+          );
+          return;
+        }
+        
+        if (normalizedTagId === normalizedCheckpointNfc || 
+            normalizedTagId.includes(normalizedCheckpointNfc) ||
+            normalizedCheckpointNfc.includes(normalizedTagId)) {
+          handleCheckpointComplete(tagId, 'nfc');
+        } else {
+          Alert.alert(
+            '❌ Tag Incorrecto',
+            `Este tag NFC no corresponde a este checkpoint.\n\nEsperado: ${checkpoint.nfc_tag_id}\nLeído: ${tagId}`,
+            [{ text: 'Reintentar', onPress: () => setScanning(false) }]
+          );
+        }
+      }
+    } catch (error) {
+      console.error('Error NFC:', error);
+      
+      if (!error.message?.includes('cancelled')) {
+        Alert.alert('Error', 'Error leyendo NFC: ' + error.message);
+      }
+    } finally {
+      await cleanupNFC();
+      setScanning(false);
+    }
+  };
+
+  const handleCheckpointComplete = async (scannedData, method) => {
+    setProcessing(true);
+    
+    try {
+      console.log('=== COMPLETANDO CHECKPOINT ===');
+      console.log('Método:', method);
+      console.log('Dato escaneado:', scannedData);
+      console.log('Checkpoint:', checkpoint.zone_name);
+      console.log('Assignment ID:', assignmentId);
+      console.log('Roadmap Zone ID:', checkpoint.roadmap_zone_id);
+      console.log('User ID:', user.car_user_id || user.user_id);
+      
+      const result = await completeCheckpoint(
+        assignmentId,
+        checkpoint.roadmap_zone_id,
+        user.car_user_id || user.user_id,
+        method,
+        null,
+        notes || null,
+        null,
+        null,
+        user.tenant_id || 1
+      );
+      
+      console.log('Resultado:', result);
+      
+      if (result.success) {
+        if (Platform.OS === 'ios') {
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        } else {
+          Vibration.vibrate([0, 100, 50, 200]);
+        }
+        
+        Alert.alert(
+          '✅ Checkpoint Completado',
+          `${checkpoint.zone_name} registrado exitosamente`,
+          [
+            {
+              text: 'OK',
+              onPress: () => {
+                navigation.pop(2);
+              }
+            }
+          ],
+          { cancelable: false }
+        );
+      } else {
+        if (result.code === 'GEOFENCE_ERROR') {
+          Alert.alert(
+            '📍 Fuera del Área',
+            result.message,
+            [{ text: 'OK', onPress: () => navigation.goBack() }]
+          );
+        } else {
+          Alert.alert('Error', result.message || 'No se pudo completar el checkpoint');
+          setScanned(false);
+          setProcessing(false);
+        }
+      }
+    } catch (error) {
+      console.error('Error completando checkpoint:', error);
+      Alert.alert('Error', 'Error al completar checkpoint: ' + error.message);
+      setScanned(false);
+      setProcessing(false);
+    }
+  };
+
+  if (!permission) {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color="#8B5CF6" />
+      </View>
+    );
+  }
+
+  if (!permission.granted) {
+    return (
+      <View style={styles.center}>
+        <MaterialIcons name="camera" size={80} color="#64748B" />
+        <Text style={styles.permText}>Permiso de cámara requerido</Text>
+        <TouchableOpacity style={styles.permButton} onPress={requestPermission}>
+          <Text style={styles.permButtonText}>Dar Permiso</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#0F172A" />
+      
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
+          <MaterialIcons name="arrow-back" size={24} color="#FFF" />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle}>Escanear Checkpoint</Text>
+        <View style={styles.headerSpacer} />
+      </View>
+
+      <View style={styles.modeSelector}>
+        <TouchableOpacity 
+          style={[styles.modeButton, mode === 'qr' && styles.modeButtonActive]} 
+          onPress={() => setMode('qr')}
+        >
+          <MaterialIcons name="qr-code-scanner" size={24} color={mode === 'qr' ? '#FFF' : '#94A3B8'} />
+          <Text style={[styles.modeText, mode === 'qr' && styles.modeTextActive]}>QR</Text>
+        </TouchableOpacity>
+        
+        <TouchableOpacity 
+          style={[styles.modeButton, mode === 'nfc' && styles.modeButtonActive, !nfcSupported && styles.modeButtonDisabled]} 
+          onPress={() => nfcSupported && setMode('nfc')}
+          disabled={!nfcSupported}
+        >
+          <MaterialIcons name="nfc" size={24} color={mode === 'nfc' ? '#FFF' : '#94A3B8'} />
+          <Text style={[styles.modeText, mode === 'nfc' && styles.modeTextActive]}>NFC</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.infoCard}>
+        <MaterialCommunityIcons name="map-marker" size={24} color="#8B5CF6" />
+        <View style={styles.infoContent}>
+          <Text style={styles.infoTitle}>{checkpoint.zone_name}</Text>
+          <Text style={styles.infoCode}>Código: {checkpoint.zone_code}</Text>
+          {checkpoint.qr_code && (
+            <Text style={styles.infoCode}>QR: {checkpoint.qr_code.substring(0, 20)}...</Text>
+          )}
+          {checkpoint.nfc_tag_id && (
+            <Text style={styles.infoCode}>NFC: {checkpoint.nfc_tag_id}</Text>
+          )}
+          {distance && (
+            <Text style={styles.infoDistance}>Distancia: {distance}m</Text>
+          )}
+        </View>
+      </View>
+
+      {mode === 'qr' ? (
+        <View style={styles.scannerContainer}>
+          <CameraView
+            style={StyleSheet.absoluteFillObject}
+            onBarcodeScanned={scanned ? undefined : handleQRScanned}
+            barcodeScannerSettings={{
+              barcodeTypes: ['qr', 'code128', 'code39'],
+            }}
+          />
+          
+          <View style={styles.overlay}>
+            <View style={styles.scanArea}>
+              <View style={styles.scanFrame}>
+                <View style={[styles.corner, styles.cornerTL]} />
+                <View style={[styles.corner, styles.cornerTR]} />
+                <View style={[styles.corner, styles.cornerBL]} />
+                <View style={[styles.corner, styles.cornerBR]} />
+              </View>
+            </View>
+            
+            <Text style={styles.instruction}>
+              {processing ? 'Procesando...' : scanned ? 'Código detectado' : 'Apunta al código QR del checkpoint'}
+            </Text>
+          </View>
+        </View>
+      ) : (
+        <View style={styles.nfcContainer}>
+          <MaterialIcons name="nfc" size={100} color={scanning ? '#8B5CF6' : '#64748B'} />
+          <Text style={styles.nfcTitle}>
+            {scanning ? 'Esperando tag NFC...' : 'Lector NFC'}
+          </Text>
+          <Text style={styles.nfcDesc}>
+            {scanning ? 'Acerca el tag NFC del checkpoint' : 'Presiona para activar el lector'}
+          </Text>
+          
+          <TouchableOpacity
+            style={[styles.nfcButton, scanning && styles.nfcButtonActive]}
+            onPress={scanning ? cleanupNFC : readNFC}
+            disabled={processing}
+          >
+            <MaterialIcons name={scanning ? "close" : "contactless"} size={32} color="#FFF" />
+            <Text style={styles.nfcButtonText}>
+              {processing ? 'Procesando...' : scanning ? 'Cancelar' : 'Iniciar Lectura'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0F172A',
+  },
+  center: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#0F172A',
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: '#1E293B',
+    borderBottomWidth: 1,
+    borderBottomColor: '#334155',
+  },
+  backButton: {
+    padding: 8,
+  },
+  headerTitle: {
+    flex: 1,
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+    textAlign: 'center',
+  },
+  headerSpacer: {
+    width: 40,
+  },
+  modeSelector: {
+    flexDirection: 'row',
+    backgroundColor: '#1E293B',
+    margin: 16,
+    padding: 4,
+    borderRadius: 12,
+  },
+  modeButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 8,
+  },
+  modeButtonActive: {
+    backgroundColor: '#8B5CF6',
+  },
+  modeButtonDisabled: {
+    opacity: 0.5,
+  },
+  modeText: {
+    marginLeft: 8,
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#94A3B8',
+  },
+  modeTextActive: {
+    color: '#FFFFFF',
+  },
+  infoCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1E293B',
+    marginHorizontal: 16,
+    marginBottom: 16,
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#8B5CF6',
+  },
+  infoContent: {
+    marginLeft: 12,
+    flex: 1,
+  },
+  infoTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+  },
+  infoCode: {
+    fontSize: 12,
+    color: '#94A3B8',
+    marginTop: 2,
+  },
+  infoDistance: {
+    fontSize: 12,
+    color: '#8B5CF6',
+    marginTop: 2,
+  },
+  scannerContainer: {
+    flex: 1,
+  },
+  overlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  scanArea: {
+    width: 280,
+    height: 280,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  scanFrame: {
+    width: 250,
+    height: 250,
+    position: 'relative',
+  },
+  corner: {
+    position: 'absolute',
+    width: 40,
+    height: 40,
+    borderColor: '#8B5CF6',
+  },
+  cornerTL: {
+    top: 0,
+    left: 0,
+    borderTopWidth: 4,
+    borderLeftWidth: 4,
+  },
+  cornerTR: {
+    top: 0,
+    right: 0,
+    borderTopWidth: 4,
+    borderRightWidth: 4,
+  },
+  cornerBL: {
+    bottom: 0,
+    left: 0,
+    borderBottomWidth: 4,
+    borderLeftWidth: 4,
+  },
+  cornerBR: {
+    bottom: 0,
+    right: 0,
+    borderBottomWidth: 4,
+    borderRightWidth: 4,
+  },
+  instruction: {
+    marginTop: 40,
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: '600',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 20,
+  },
+  nfcContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  nfcTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+    marginTop: 24,
+  },
+  nfcDesc: {
+    fontSize: 14,
+    color: '#94A3B8',
+    textAlign: 'center',
+    marginTop: 8,
+    marginBottom: 32,
+  },
+  nfcButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#8B5CF6',
+    paddingVertical: 16,
+    paddingHorizontal: 32,
+    borderRadius: 12,
+  },
+  nfcButtonActive: {
+    backgroundColor: '#EF4444',
+  },
+  nfcButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginLeft: 12,
+  },
+  permText: {
+    color: '#94A3B8',
+    fontSize: 16,
+    marginTop: 16,
+  },
+  permButton: {
+    backgroundColor: '#8B5CF6',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    marginTop: 24,
+  },
+  permButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+});

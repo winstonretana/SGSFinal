@@ -1,0 +1,507 @@
+// ============================================
+// SENTINEL SERVICE - OPTIMIZADO PARA ZEBRA
+// ============================================
+// Los dispositivos Zebra tienen optimizaciones agresivas
+// que matan servicios background. Esta versión está 
+// optimizada específicamente para Zebra.
+// ============================================
+
+import * as Location from 'expo-location';
+import * as TaskManager from 'expo-task-manager';
+import axios from 'axios';
+import { API_CONFIG, ENDPOINTS } from '../config/api';
+import { getData, saveData, STORAGE_KEYS } from '../utils/storage';
+
+const GPS_TASK_NAME = 'SENTINEL_GPS_TRACKING';
+
+// ✅ CONFIGURACIÓN ESPECÍFICA PARA ZEBRA
+const ZEBRA_GPS_CONFIG = {
+  // Intervalos más largos para evitar que Zebra mate el servicio
+  DURING_SHIFT: 180000,     // 3 minutos (en vez de 2)
+  OFF_SHIFT: 600000,        // 10 minutos
+  
+  // Precisión balanceada (High consume mucha batería en Zebra)
+  accuracy: Location.Accuracy.Balanced,
+  
+  // Distancia mínima para actualizar (importante en Zebra)
+  distanceInterval: 1,     // Solo actualizar si se mueve 20m
+  
+  // Configuración de foreground service CRÍTICA para Zebra
+  foregroundService: {
+    notificationTitle: '🛰️ SGS Sentinel Activo',
+    notificationBody: 'Tracking GPS cada 3 minutos',
+    notificationColor: '#3B82F6',
+    killServiceOnDestroy: false,  // ⚠️ CRÍTICO para Zebra
+    notificationPriority: 'high'  // ⚠️ CRÍTICO para Zebra
+  },
+  
+  // NO pausar automáticamente (Zebra lo interpreta como que puede matar)
+  pausesUpdatesAutomatically: false,
+  
+  // Actividad = Other (la más estable en Zebra)
+  activityType: Location.ActivityType.Other,
+  
+  // Mostrar indicador de ubicación (ayuda a mantener prioridad)
+  showsBackgroundLocationIndicator: true
+};
+
+// Variables de estado
+let currentInterval = ZEBRA_GPS_CONFIG.DURING_SHIFT;
+let lastSuccessfulSend = null;
+let consecutiveErrors = 0;
+
+// ============================================
+// TASK MANAGER - ULTRA ROBUSTO PARA ZEBRA
+// ============================================
+
+TaskManager.defineTask(GPS_TASK_NAME, async ({ data: { locations }, error }) => {
+  const timestamp = new Date().toLocaleTimeString();
+  
+  if (error) {
+    console.error('❌ GPS Task Error:', error);
+    consecutiveErrors++;
+    
+    // Si hay muchos errores consecutivos, intentar recuperar
+    if (consecutiveErrors >= 3) {
+      console.log('🔄 Demasiados errores, intentando recuperar...');
+      setTimeout(async () => {
+        try {
+          await autoRecoverGPS();
+          consecutiveErrors = 0;
+        } catch (e) {
+          console.error('❌ Recuperación fallida:', e);
+        }
+      }, 30000);
+    }
+    return;
+  }
+
+  if (!locations || locations.length === 0) {
+    console.log('⚠️ No hay ubicaciones disponibles');
+    return;
+  }
+
+  const location = locations[0];
+  
+  console.log('=== ZEBRA GPS TASK ===');
+  console.log(`🛰️ Timestamp: ${timestamp}`);
+  console.log(`📍 Lat: ${location.coords.latitude.toFixed(6)}`);
+  console.log(`📍 Lon: ${location.coords.longitude.toFixed(6)}`);
+  console.log(`🎯 Accuracy: ${location.coords.accuracy}m`);
+  console.log('======================');
+  
+  try {
+    await sendLocationToServer(location);
+    lastSuccessfulSend = new Date();
+    consecutiveErrors = 0;
+    console.log('✅ GPS Task completado exitosamente');
+    
+  } catch (error) {
+    console.error('❌ Error enviando ubicación:', error.message);
+    consecutiveErrors++;
+    
+    // Guardar offline
+    const user = await getData(STORAGE_KEYS.USER);
+    const zones = await getData(STORAGE_KEYS.ZONES);
+    const userZone = zones?.sentinel?.[0] || zones?.all?.find(z => z.is_sentinel_zone);
+    
+    await saveOfflineGPSPosition(location, userZone?.zone_id, user);
+  }
+});
+
+// ============================================
+// ENVÍO AL SERVIDOR - CON LOGGING DETALLADO
+// ============================================
+
+const sendLocationToServer = async (location, retryCount = 0) => {
+  try {
+    const user = await getData(STORAGE_KEYS.USER);
+    
+    if (!user?.tenant_id) {
+      throw new Error('Usuario sin tenant_id');
+    }
+
+    if (!user?.access?.hasSentinel) {
+      throw new Error('Usuario sin permisos Sentinel');
+    }
+
+    const zones = await getData(STORAGE_KEYS.ZONES);
+    const userZone = zones?.sentinel?.[0] || zones?.all?.find(z => z.is_sentinel_zone);
+    
+    if (!userZone) {
+      throw new Error('Usuario sin zona Sentinel asignada');
+    }
+
+    // Timestamp en formato ISO 8601 (compatible con SQL Server)
+    const isoTimestamp = new Date(location.timestamp).toISOString();
+    
+    const trackingData = {
+      user_id: user.car_user_id || user.user_id,
+      tenant_id: user.tenant_id,
+      zone_id: userZone.zone_id,
+      latitude: location.coords.latitude,
+      longitude: location.coords.longitude,
+      accuracy: location.coords.accuracy,
+      speed: location.coords.speed || 0,
+      timestamp: isoTimestamp,
+      device_info: 'Zebra - Sentinel'
+    };
+
+    console.log('📤 ENVIANDO A SERVIDOR:');
+    console.log('URL:', `${API_CONFIG.BASE_URL}${ENDPOINTS.SENTINEL_TRACK}`);
+    console.log('User ID:', trackingData.user_id);
+    console.log('Tenant ID:', trackingData.tenant_id);
+    console.log('Zone ID:', trackingData.zone_id);
+    console.log('Timestamp:', trackingData.timestamp);
+    console.log('Payload completo:', JSON.stringify(trackingData, null, 2));
+
+    const response = await axios.post(
+      `${API_CONFIG.BASE_URL}${ENDPOINTS.SENTINEL_TRACK}`,
+      trackingData,
+      { 
+        timeout: 20000,  // Timeout más largo para Zebra (puede tener red más lenta)
+        headers: { 
+          'Content-Type': 'application/json',
+          'User-Agent': 'SGS-Sentinel-Zebra/1.0'
+        }
+      }
+    );
+
+    console.log('📥 RESPUESTA DEL SERVIDOR:');
+    console.log('Status:', response.status);
+    console.log('Data:', JSON.stringify(response.data, null, 2));
+
+    if (response.data.success) {
+      console.log('✅ Posición GPS enviada exitosamente');
+      
+      // Guardar última posición exitosa
+      await saveData(STORAGE_KEYS.LAST_GPS_POSITION, {
+        ...trackingData,
+        synced: true,
+        sent_at: new Date().toISOString()
+      });
+      
+      return true;
+    } else {
+      throw new Error(response.data.error || 'Error del servidor');
+    }
+
+  } catch (error) {
+    console.error('❌ ERROR ENVIANDO GPS:');
+    console.error('Mensaje:', error.message);
+    console.error('Response status:', error.response?.status);
+    console.error('Response data:', JSON.stringify(error.response?.data, null, 2));
+    
+    // Reintentar solo una vez
+    if (retryCount === 0) {
+      console.log('🔄 Reintentando en 5 segundos...');
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return sendLocationToServer(location, 1);
+    }
+    
+    throw error;
+  }
+};
+
+// ============================================
+// GUARDAR OFFLINE
+// ============================================
+
+const saveOfflineGPSPosition = async (location, zoneId, user) => {
+  try {
+    if (!user?.tenant_id) {
+      console.error('❌ No se puede guardar offline - sin tenant_id');
+      return;
+    }
+    
+    const pendingPositions = await getData(STORAGE_KEYS.PENDING_GPS) || [];
+    
+    const offlinePosition = {
+      user_id: user.car_user_id || user.user_id,
+      tenant_id: user.tenant_id,
+      zone_id: zoneId,
+      latitude: location.coords.latitude,
+      longitude: location.coords.longitude,
+      accuracy: location.coords.accuracy,
+      speed: location.coords.speed || 0,
+      timestamp: new Date(location.timestamp).toISOString(),
+      device_info: 'Zebra - Sentinel (Offline)',
+      offline_id: `gps_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      queued_at: new Date().toISOString()
+    };
+
+    // Limitar a 50 posiciones offline (Zebra tiene memoria limitada)
+    if (pendingPositions.length >= 50) {
+      pendingPositions.shift();
+    }
+
+    pendingPositions.push(offlinePosition);
+    await saveData(STORAGE_KEYS.PENDING_GPS, pendingPositions);
+    
+    console.log(`💾 Posición guardada offline (${pendingPositions.length} pendientes)`);
+  } catch (error) {
+    console.error('❌ Error guardando GPS offline:', error);
+  }
+};
+
+// ============================================
+// INICIAR TRACKING - ESPECÍFICO PARA ZEBRA
+// ============================================
+
+export const startGPSTracking = async () => {
+  try {
+    console.log('=== INICIANDO GPS TRACKING EN ZEBRA ===');
+    
+    const user = await getData(STORAGE_KEYS.USER);
+    
+    if (!user) {
+      console.error('❌ No hay sesión de usuario');
+      return { success: false, message: 'No hay sesión de usuario' };
+    }
+    
+    if (!user.tenant_id) {
+      console.error('❌ Usuario sin tenant_id');
+      return { success: false, message: 'Usuario sin tenant_id' };
+    }
+    
+    if (!user.access?.hasSentinel) {
+      console.error('❌ Usuario sin permisos Sentinel');
+      return { success: false, message: 'Usuario sin permisos Sentinel' };
+    }
+
+    const zones = await getData(STORAGE_KEYS.ZONES);
+    console.log('📦 Zonas cargadas:', JSON.stringify(zones, null, 2));
+    
+    const userZone = zones?.sentinel?.[0] || zones?.all?.find(z => z.is_sentinel_zone);
+    
+    if (!userZone) {
+      console.error('❌ Usuario sin zona Sentinel');
+      console.log('Zonas disponibles:', zones);
+      return { success: false, message: 'No tienes zona Sentinel asignada' };
+    }
+
+    console.log(`✅ Zona Sentinel encontrada: ${userZone.zone_name} (ID: ${userZone.zone_id})`);
+
+    // Solicitar permisos
+    const { status: foregroundStatus } = await Location.requestForegroundPermissionsAsync();
+    console.log('📍 Permiso foreground:', foregroundStatus);
+    
+    if (foregroundStatus !== 'granted') {
+      return { success: false, message: 'Permisos de ubicación denegados' };
+    }
+
+    const { status: backgroundStatus } = await Location.requestBackgroundPermissionsAsync();
+    console.log('📍 Permiso background:', backgroundStatus);
+
+    // Verificar si ya está corriendo
+    const isRunning = await Location.hasStartedLocationUpdatesAsync(GPS_TASK_NAME);
+    if (isRunning) {
+      console.log('ℹ️ GPS ya está activo');
+      return { success: true, message: 'GPS ya está activo', alreadyRunning: true };
+    }
+
+    console.log('🚀 Iniciando Location Updates con config Zebra...');
+
+    // ⚠️ CONFIGURACIÓN CRÍTICA PARA ZEBRA
+    await Location.startLocationUpdatesAsync(GPS_TASK_NAME, {
+      accuracy: ZEBRA_GPS_CONFIG.accuracy,
+      timeInterval: ZEBRA_GPS_CONFIG.DURING_SHIFT,
+      distanceInterval: ZEBRA_GPS_CONFIG.distanceInterval,
+      deferredUpdatesInterval: ZEBRA_GPS_CONFIG.DURING_SHIFT,
+      foregroundService: {
+        ...ZEBRA_GPS_CONFIG.foregroundService,
+        notificationBody: `Tracking cada 3min en ${userZone.zone_name}`
+      },
+      pausesUpdatesAutomatically: ZEBRA_GPS_CONFIG.pausesUpdatesAutomatically,
+      activityType: ZEBRA_GPS_CONFIG.activityType,
+      showsBackgroundLocationIndicator: ZEBRA_GPS_CONFIG.showsBackgroundLocationIndicator
+    });
+
+    await saveData(STORAGE_KEYS.GPS_TRACKING_ACTIVE, true);
+
+    console.log('✅ GPS Tracking iniciado exitosamente en Zebra');
+    
+    return { 
+      success: true, 
+      message: 'GPS iniciado (optimizado para Zebra)',
+      interval: '3 minutos',
+      zone: userZone.zone_name,
+      device: 'Zebra'
+    };
+
+  } catch (error) {
+    console.error('❌ ERROR INICIANDO GPS EN ZEBRA:');
+    console.error('Error completo:', error);
+    console.error('Stack:', error.stack);
+    return { success: false, message: error.message };
+  }
+};
+
+// ============================================
+// DETENER TRACKING
+// ============================================
+
+export const stopGPSTracking = async () => {
+  try {
+    console.log('🛑 Deteniendo GPS Tracking en Zebra...');
+    
+    const isRunning = await Location.hasStartedLocationUpdatesAsync(GPS_TASK_NAME);
+    
+    if (isRunning) {
+      await Location.stopLocationUpdatesAsync(GPS_TASK_NAME);
+      await saveData(STORAGE_KEYS.GPS_TRACKING_ACTIVE, false);
+      console.log('✅ GPS detenido');
+      return { success: true, message: 'GPS detenido' };
+    }
+    
+    return { success: true, message: 'GPS no estaba activo' };
+    
+  } catch (error) {
+    console.error('❌ Error deteniendo GPS:', error);
+    return { success: false, message: error.message };
+  }
+};
+
+// ============================================
+// AUTO-RECUPERACIÓN
+// ============================================
+
+const autoRecoverGPS = async () => {
+  try {
+    console.log('🔄 AUTO-RECUPERACIÓN GPS EN ZEBRA...');
+    
+    const user = await getData(STORAGE_KEYS.USER);
+    if (!user?.access?.hasSentinel) {
+      console.log('❌ Usuario sin acceso Sentinel');
+      return false;
+    }
+
+    const isRunning = await Location.hasStartedLocationUpdatesAsync(GPS_TASK_NAME);
+    if (isRunning) {
+      console.log('✅ GPS Task sigue activo');
+      return true;
+    }
+
+    console.log('⚠️ GPS Task se detuvo, reiniciando...');
+    const result = await startGPSTracking();
+    return result.success;
+    
+  } catch (error) {
+    console.error('❌ Error en auto-recuperación:', error);
+    return false;
+  }
+};
+
+// ============================================
+// FUNCIONES DE ESTADO
+// ============================================
+
+export const isGPSTrackingActive = async () => {
+  try {
+    const isRunning = await Location.hasStartedLocationUpdatesAsync(GPS_TASK_NAME);
+    const savedState = await getData(STORAGE_KEYS.GPS_TRACKING_ACTIVE);
+    
+    if (isRunning !== savedState) {
+      await saveData(STORAGE_KEYS.GPS_TRACKING_ACTIVE, isRunning);
+    }
+    
+    return isRunning;
+  } catch (error) {
+    return false;
+  }
+};
+
+export const getTrackingStats = async () => {
+  try {
+    const isActive = await isGPSTrackingActive();
+    const lastPosition = await getData(STORAGE_KEYS.LAST_GPS_POSITION);
+    const pendingPositions = await getData(STORAGE_KEYS.PENDING_GPS) || [];
+    
+    return {
+      isActive,
+      lastPosition,
+      pendingCount: pendingPositions.length,
+      lastSyncAt: lastPosition?.sent_at || null,
+      lastSuccessfulSend: lastSuccessfulSend?.toLocaleTimeString() || 'Nunca',
+      consecutiveErrors,
+      currentInterval: '3 minutos',
+      device: 'Zebra',
+      robust: true
+    };
+  } catch (error) {
+    return {
+      isActive: false,
+      pendingCount: 0,
+      robust: false
+    };
+  }
+};
+
+export const syncPendingGPS = async () => {
+  try {
+    const pendingPositions = await getData(STORAGE_KEYS.PENDING_GPS) || [];
+    
+    if (pendingPositions.length === 0) {
+      return { success: true, synced: 0, failed: 0 };
+    }
+
+    console.log(`📤 Sincronizando ${pendingPositions.length} posiciones offline...`);
+    
+    let successCount = 0;
+    const failedPositions = [];
+
+    for (const position of pendingPositions) {
+      try {
+        const response = await axios.post(
+          `${API_CONFIG.BASE_URL}${ENDPOINTS.SENTINEL_TRACK}`,
+          position,
+          { timeout: 15000 }
+        );
+
+        if (response.data.success) {
+          successCount++;
+        } else {
+          failedPositions.push(position);
+        }
+      } catch (error) {
+        failedPositions.push(position);
+      }
+    }
+
+    await saveData(STORAGE_KEYS.PENDING_GPS, failedPositions);
+
+    console.log(`✅ Sincronización: ${successCount} enviadas, ${failedPositions.length} pendientes`);
+
+    return {
+      success: true,
+      synced: successCount,
+      failed: failedPositions.length
+    };
+
+  } catch (error) {
+    console.error('❌ Error sincronizando GPS:', error);
+    return { success: false, synced: 0, failed: 0 };
+  }
+};
+
+export const getCurrentPosition = async () => {
+  try {
+    const location = await Location.getCurrentPositionAsync({
+      accuracy: Location.Accuracy.High,
+      maximumAge: 10000
+    });
+
+    return {
+      success: true,
+      data: {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+        accuracy: location.coords.accuracy,
+        timestamp: new Date(location.timestamp).toISOString()
+      }
+    };
+    
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+};

@@ -1,0 +1,210 @@
+// src/utils/sync.js
+import { getData, saveData, STORAGE_KEYS } from './storage';
+import { API_CONFIG, ENDPOINTS } from '../config/api';
+import axios from 'axios';
+import NetInfo from '@react-native-community/netinfo';
+
+// Verificar conexión real
+const checkConnection = async () => {
+  try {
+    const state = await NetInfo.fetch();
+    console.log('📶 Estado de red:', {
+      isConnected: state.isConnected,
+      isInternetReachable: state.isInternetReachable,
+      type: state.type
+    });
+    
+    // Solo confiar si hay conexión real a internet
+    if (state.isConnected && state.isInternetReachable !== false) {
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.log('Error verificando conexión:', error);
+    return true; // Asumir que hay conexión si no podemos verificar
+  }
+};
+
+// ENVIAR marcas pendientes al servidor
+export const syncPendingMarks = async () => {
+  try {
+    console.log('=== INICIANDO SINCRONIZACIÓN ===');
+    
+    // Verificar conexión primero
+    const isOnline = await checkConnection();
+    if (!isOnline) {
+      console.log('📵 Sin conexión para sincronizar');
+      return { 
+        success: false, 
+        message: 'Sin conexión a internet',
+        synced: 0,
+        failed: 0
+      };
+    }
+
+    const pendingMarks = await getData(STORAGE_KEYS.PENDING_MARKS) || [];
+    
+    if (pendingMarks.length === 0) {
+      console.log('✅ No hay marcas pendientes');
+      return { 
+        success: true, 
+        synced: 0,
+        failed: 0,
+        message: 'No hay marcas pendientes'
+      };
+    }
+
+    console.log(`📤 Encontradas ${pendingMarks.length} marcas pendientes`);
+    
+    let successCount = 0;
+    const failedMarks = [];
+    const errors = [];
+
+    // Enviar cada marca pendiente
+    for (let i = 0; i < pendingMarks.length; i++) {
+      const mark = pendingMarks[i];
+      
+      try {
+        console.log(`[${i+1}/${pendingMarks.length}] Enviando: ${mark.attendance_type} - ${mark.timestamp}`);
+        
+       const url = `${API_CONFIG.BASE_URL}${ENDPOINTS.ATTENDANCE_CHECK}`; 
+        
+        const response = await axios.post(url, mark, { 
+          timeout: 15000,
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          validateStatus: function (status) {
+            return status < 500; // Aceptar respuestas 400 para no reintentar
+          }
+        });
+
+        console.log(`Respuesta para marca ${i+1}:`, {
+          status: response.status,
+          success: response.data.success,
+          message: response.data.error || response.data.message
+        });
+
+        if (response.data.success) {
+          successCount++;
+          console.log(`✅ [${i+1}] Sincronizada exitosamente`);
+        } else if (response.status === 400) {
+          // Error de validación - No reintentar esta marca
+          console.log(`⚠️ [${i+1}] Rechazada por validación: ${response.data.error}`);
+          errors.push(`${mark.attendance_type}: ${response.data.error}`);
+          // No la agregamos a failedMarks porque no tiene sentido reintentarla
+        } else {
+          // Otro error - Guardar para reintentar después
+          console.log(`❌ [${i+1}] Error del servidor, se reintentará después`);
+          failedMarks.push(mark);
+        }
+        
+      } catch (error) {
+        console.error(`❌ [${i+1}] Error de red:`, error.message);
+        failedMarks.push(mark);
+        errors.push(`${mark.attendance_type}: Error de conexión`);
+      }
+    }
+
+    // Actualizar storage solo con las marcas que fallaron por red/servidor
+    console.log(`📊 Resultado: ${successCount} exitosas, ${failedMarks.length} pendientes`);
+    
+    if (failedMarks.length > 0) {
+      await saveData(STORAGE_KEYS.PENDING_MARKS, failedMarks);
+      console.log(`💾 ${failedMarks.length} marcas guardadas para reintentar`);
+    } else {
+      // Limpiar todo si todas se procesaron
+      await saveData(STORAGE_KEYS.PENDING_MARKS, []);
+      console.log('🧹 Todas las marcas procesadas, limpiando pendientes');
+    }
+    
+    // Guardar timestamp de última sincronización
+    await saveData(STORAGE_KEYS.LAST_SYNC, new Date().toISOString());
+    
+    const result = {
+      success: successCount > 0 || failedMarks.length === 0,
+      synced: successCount,
+      failed: failedMarks.length,
+      message: `${successCount} sincronizada${successCount !== 1 ? 's' : ''}, ${failedMarks.length} pendiente${failedMarks.length !== 1 ? 's' : ''}`,
+      errors: errors.length > 0 ? errors : undefined
+    };
+    
+    console.log('=== SINCRONIZACIÓN COMPLETADA ===', result);
+    return result;
+
+  } catch (error) {
+    console.error('❌ Error general en sincronización:', error);
+    return { 
+      success: false, 
+      error: error.message,
+      synced: 0,
+      failed: 0,
+      message: 'Error al sincronizar'
+    };
+  }
+};
+
+// AGREGAR marca a la cola de pendientes
+export const addPendingMark = async (markData) => {
+  try {
+    const pendingMarks = await getData(STORAGE_KEYS.PENDING_MARKS) || [];
+    
+    // Verificar que no esté duplicada
+    const isDuplicate = pendingMarks.some(m => 
+      m.offline_id === markData.offline_id ||
+      (m.timestamp === markData.timestamp && m.attendance_type === markData.attendance_type)
+    );
+    
+    if (isDuplicate) {
+      console.log('⚠️ Marca duplicada, no se agregará');
+      return true; // Retornar true para no bloquear el flujo
+    }
+    
+    pendingMarks.push({
+      ...markData,
+      queued_at: new Date().toISOString()
+    });
+    
+    await saveData(STORAGE_KEYS.PENDING_MARKS, pendingMarks);
+    console.log(`💾 Marca agregada a pendientes. Total: ${pendingMarks.length}`);
+    return true;
+    
+  } catch (error) {
+    console.error('Error agregando marca pendiente:', error);
+    return false;
+  }
+};
+
+// Obtener número de marcas pendientes
+export const getPendingCount = async () => {
+  try {
+    const pendingMarks = await getData(STORAGE_KEYS.PENDING_MARKS) || [];
+    return pendingMarks.length;
+  } catch (error) {
+    console.error('Error obteniendo marcas pendientes:', error);
+    return 0;
+  }
+};
+
+// Limpiar marcas antiguas (más de 7 días)
+export const cleanOldPendingMarks = async () => {
+  try {
+    const pendingMarks = await getData(STORAGE_KEYS.PENDING_MARKS) || [];
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    
+    const validMarks = pendingMarks.filter(mark => {
+      const markDate = new Date(mark.queued_at || mark.timestamp);
+      return markDate > sevenDaysAgo;
+    });
+    
+    if (validMarks.length < pendingMarks.length) {
+      await saveData(STORAGE_KEYS.PENDING_MARKS, validMarks);
+      console.log(`🧹 Limpiadas ${pendingMarks.length - validMarks.length} marcas antiguas`);
+    }
+    
+    return validMarks.length;
+  } catch (error) {
+    console.error('Error limpiando marcas antiguas:', error);
+    return 0;
+  }
+};

@@ -1,0 +1,385 @@
+import React, { useState, useEffect } from 'react';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ActivityIndicator, SafeAreaView, StatusBar, KeyboardAvoidingView, Platform, Linking } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+import Constants from 'expo-constants';
+import { login } from '../services/authService';
+import { initGeofencing } from '../services/geofencingService';
+import axios from 'axios';
+import { API_CONFIG, ENDPOINTS } from '../config/api';
+
+const CURRENT_VERSION = Constants.expoConfig?.version || Constants.manifest?.version || '1.0.0';
+const CURRENT_BUILD = Constants.expoConfig?.android?.versionCode || Constants.manifest?.android?.versionCode || 1;
+
+export default function LoginScreen({ navigation }) {
+  const [identification, setIdentification] = useState('');
+  const [pin, setPin] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [checkingVersion, setCheckingVersion] = useState(true);
+  const [updateInfo, setUpdateInfo] = useState(null);
+
+  useEffect(() => {
+    checkAppVersion();
+  }, []);
+
+  const checkAppVersion = async () => {
+    try {
+      console.log(`📱 Versión actual de la app: ${CURRENT_VERSION} (Build ${CURRENT_BUILD})`);
+      
+      const response = await axios.get(
+        `${API_CONFIG.BASE_URL}${ENDPOINTS.APP_VERSION}`,
+        { timeout: 5000 }
+      );
+      
+      if (response.data.success) {
+        const serverVersion = response.data.data;
+        
+        console.log(`🌐 Versión del servidor: ${serverVersion.version} (Build ${serverVersion.build})`);
+        console.log(`⚠️ Versión mínima requerida: ${serverVersion.min_version}`);
+        console.log(`🔒 Force update: ${serverVersion.required_update}`);
+        
+        const needsUpdate = compareVersions(CURRENT_VERSION, serverVersion.version) < 0;
+        const isMandatory = serverVersion.required_update || 
+                           compareVersions(CURRENT_VERSION, serverVersion.min_version) < 0;
+        
+        if (needsUpdate) {
+          console.log(`🔄 Se necesita actualización (Mandatory: ${isMandatory})`);
+          setUpdateInfo({
+            ...serverVersion,
+            mandatory: isMandatory
+          });
+          
+          if (isMandatory) {
+            showMandatoryUpdateModal(serverVersion);
+          } else {
+            showOptionalUpdateModal(serverVersion);
+          }
+        } else {
+          console.log('✅ App actualizada');
+        }
+      }
+    } catch (error) {
+      console.log('⚠️ No se pudo verificar versión:', error.message);
+    } finally {
+      setCheckingVersion(false);
+    }
+  };
+
+  const compareVersions = (v1, v2) => {
+    const parts1 = v1.split('.').map(Number);
+    const parts2 = v2.split('.').map(Number);
+    
+    for (let i = 0; i < 3; i++) {
+      if (parts1[i] > parts2[i]) return 1;
+      if (parts1[i] < parts2[i]) return -1;
+    }
+    return 0;
+  };
+
+  const showMandatoryUpdateModal = (versionInfo) => {
+    Alert.alert(
+      '⚠️ Actualización Requerida',
+      `Esta versión (${CURRENT_VERSION}) ya no es compatible.\n\nSe requiere actualizar a la versión ${versionInfo.version}\n\n📋 Cambios:\n${versionInfo.changelog || 'Mejoras de rendimiento y seguridad'}`,
+      [
+        {
+          text: '📥 Descargar Actualización',
+          onPress: () => {
+            if (versionInfo.download_url) {
+              Linking.openURL(versionInfo.download_url);
+            } else {
+              Alert.alert('Error', 'URL de descarga no disponible');
+            }
+          }
+        }
+      ],
+      { cancelable: false }
+    );
+  };
+
+  const showOptionalUpdateModal = (versionInfo) => {
+    Alert.alert(
+      '🔔 Actualización Disponible',
+      `Nueva versión ${versionInfo.version} disponible\n\n📋 Cambios:\n${versionInfo.changelog || 'Mejoras generales'}`,
+      [
+        {
+          text: 'Ahora No',
+          style: 'cancel'
+        },
+        {
+          text: '📥 Actualizar',
+          onPress: () => {
+            if (versionInfo.download_url) {
+              Linking.openURL(versionInfo.download_url);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const initGeofencingBackground = async (user) => {
+    try {
+      const zonesResponse = await axios.get(
+        `${API_CONFIG.BASE_URL}/api/attendance/mobile/zones?tenant_id=${user.tenant_id || 1}`,
+        { timeout: 5000 }
+      );
+      
+      if (zonesResponse.data.success && zonesResponse.data.data.length > 0) {
+        console.log(`✅ ${zonesResponse.data.data.length} zonas cargadas`);
+        initGeofencing(zonesResponse.data.data).catch(err => {
+          console.log('⚠️ Geofencing error:', err.message);
+        });
+      }
+    } catch (error) {
+      console.log('⚠️ Error cargando zonas:', error.message);
+    }
+  };
+
+  const handleLogin = async () => {
+    if (!identification || !pin) {
+      Alert.alert('Error', 'Completa todos los campos');
+      return;
+    }
+
+    if (updateInfo?.mandatory) {
+      showMandatoryUpdateModal(updateInfo);
+      return;
+    }
+
+    setLoading(true);
+    
+    try {
+      console.log('🔐 Intentando login...');
+      const response = await login(identification, pin);
+      
+      console.log('📦 Respuesta login:', {
+        success: response.success,
+        hasAccess: response.access?.hasAnyAccess,
+        hasSentinel: response.access?.hasSentinel
+      });
+      
+      if (response.success) {
+        console.log('✅ Login exitoso:', response.user.name);
+        console.log('📋 Módulos:', response.access.modules);
+        
+        // Navegar inmediatamente
+        navigation.replace('Home', { user: response.user });
+        
+        // Servicios en background sin bloquear
+        setTimeout(() => {
+          initGeofencingBackground(response.user).catch(err => 
+            console.log('Background error:', err.message)
+          );
+        }, 100);
+        
+      } else {
+        Alert.alert('Error', response.message);
+        setLoading(false);
+      }
+    } catch (error) {
+      console.error('❌ Error en handleLogin:', error);
+      Alert.alert('Error', 'Error de conexión');
+      setLoading(false);
+    }
+  };
+
+  if (checkingVersion) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.centerContent}>
+          <ActivityIndicator size="large" color="#3B82F6" />
+          <Text style={styles.checkingText}>Verificando versión...</Text>
+          <Text style={styles.versionText}>v{CURRENT_VERSION} (Build {CURRENT_BUILD})</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#0F172A" />
+      <KeyboardAvoidingView 
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={styles.keyboardView}
+      >
+        <View style={styles.content}>
+          <View style={styles.header}>
+            <View style={styles.logoContainer}>
+              <MaterialIcons name="security" size={60} color="#3B82F6" />
+            </View>
+            <Text style={styles.title}>SGS Suite</Text>
+            <Text style={styles.subtitle}>Control de Seguridad</Text>
+            
+            {updateInfo && !updateInfo.mandatory && (
+              <View style={styles.updateBanner}>
+                <MaterialIcons name="info" size={16} color="#F59E0B" />
+                <Text style={styles.updateText}>Actualización disponible</Text>
+              </View>
+            )}
+          </View>
+
+          <View style={styles.form}>
+            <View style={styles.inputContainer}>
+              <MaterialIcons name="badge" size={24} color="#64748B" />
+              <TextInput
+                style={styles.input}
+                placeholder="Identificación"
+                value={identification}
+                onChangeText={setIdentification}
+                autoCapitalize="none"
+                placeholderTextColor="#94A3B8"
+              />
+            </View>
+
+            <View style={styles.inputContainer}>
+              <MaterialIcons name="lock" size={24} color="#64748B" />
+              <TextInput
+                style={styles.input}
+                placeholder="PIN"
+                value={pin}
+                onChangeText={setPin}
+                secureTextEntry
+                keyboardType="numeric"
+                maxLength={6}
+                placeholderTextColor="#94A3B8"
+              />
+            </View>
+
+            <TouchableOpacity 
+              style={[styles.button, loading && styles.buttonDisabled]} 
+              onPress={handleLogin}
+              disabled={loading}
+            >
+              {loading ? (
+                <ActivityIndicator color="#FFF" />
+              ) : (
+                <>
+                  <Text style={styles.buttonText}>Ingresar</Text>
+                  <MaterialIcons name="arrow-forward" size={20} color="#FFF" />
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.footer}>
+            <Text style={styles.footerText}>SGS Security Services</Text>
+            <Text style={styles.versionText}>v{CURRENT_VERSION} (Build {CURRENT_BUILD})</Text>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0F172A',
+  },
+  centerContent: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  keyboardView: {
+    flex: 1,
+  },
+  content: {
+    flex: 1,
+    paddingHorizontal: 24,
+    justifyContent: 'space-between',
+  },
+  header: {
+    alignItems: 'center',
+    paddingTop: 60,
+  },
+  logoContainer: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    backgroundColor: '#1E293B',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  title: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: '#FFF',
+    marginBottom: 8,
+  },
+  subtitle: {
+    fontSize: 16,
+    color: '#94A3B8',
+  },
+  updateBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF3C7',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+    marginTop: 16,
+    gap: 8,
+  },
+  updateText: {
+    color: '#92400E',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  form: {
+    gap: 16,
+  },
+  inputContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1E293B',
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  input: {
+    flex: 1,
+    paddingVertical: 16,
+    paddingHorizontal: 12,
+    fontSize: 16,
+    color: '#FFF',
+  },
+  button: {
+    backgroundColor: '#3B82F6',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 16,
+    borderRadius: 12,
+    marginTop: 8,
+    gap: 8,
+  },
+  buttonDisabled: {
+    opacity: 0.6,
+  },
+  buttonText: {
+    color: '#FFF',
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  footer: {
+    alignItems: 'center',
+    paddingBottom: 40,
+  },
+  footerText: {
+    color: '#64748B',
+    fontSize: 14,
+    marginBottom: 4,
+  },
+  versionText: {
+    color: '#475569',
+    fontSize: 12,
+  },
+  checkingText: {
+    color: '#94A3B8',
+    fontSize: 16,
+    marginTop: 16,
+  },
+});

@@ -1,0 +1,668 @@
+// src/screens/CheckpointDetailScreen.js - CON ESCÁNER QR/NFC
+import React, { useState, useEffect } from 'react';
+import {
+  View, Text, StyleSheet, TouchableOpacity, TextInput,
+  ScrollView, ActivityIndicator, SafeAreaView, StatusBar, Alert, Modal
+} from 'react-native';
+import { MaterialIcons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { completeCheckpoint, skipCheckpoint, calculateDistance } from '../services/roundsService';
+import * as Haptics from 'expo-haptics';
+import * as Location from 'expo-location';
+
+export default function CheckpointDetailScreen({ route, navigation }) {
+  const { user, assignmentId, checkpoint } = route.params || {};
+  
+  const [userLocation, setUserLocation] = useState(null);
+  const [distance, setDistance] = useState(null);
+  const [notes, setNotes] = useState('');
+  const [completing, setCompleting] = useState(false);
+  const [showSkipModal, setShowSkipModal] = useState(false);
+  const [skipReason, setSkipReason] = useState('');
+  const [skipCategory, setSkipCategory] = useState('other');
+
+  useEffect(() => {
+    getUserLocation();
+  }, []);
+
+  const getUserLocation = async () => {
+    try {
+      const location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+        timeout: 5000
+      });
+      
+      setUserLocation(location.coords);
+      
+      if (checkpoint.latitude && checkpoint.longitude) {
+        const dist = calculateDistance(
+          location.coords.latitude,
+          location.coords.longitude,
+          parseFloat(checkpoint.latitude),
+          parseFloat(checkpoint.longitude)
+        );
+        setDistance(Math.round(dist));
+      }
+    } catch (error) {
+      console.error('Error getting location:', error);
+      Alert.alert(
+        'GPS Desactivado',
+        'Necesitas activar el GPS para completar checkpoints',
+        [{ text: 'OK' }]
+      );
+    }
+  };
+
+  // ✅ NUEVO: Ir a escanear QR/NFC
+  const handleScanCheckpoint = () => {
+    if (!userLocation) {
+      Alert.alert('Sin GPS', 'Obteniendo ubicación...');
+      return;
+    }
+    
+    // Navegar al escáner pasando la info del checkpoint
+    navigation.navigate('CheckpointScanner', {
+      user,
+      assignmentId,
+      checkpoint,
+      userLocation,
+      distance,
+      notes
+    });
+  };
+
+  const handleSkipCheckpoint = async () => {
+    if (!skipReason || skipReason.length < 20) {
+      Alert.alert('Razón Requerida', 'Debes escribir una razón de al menos 20 caracteres');
+      return;
+    }
+    
+    setCompleting(true);
+    
+    const result = await skipCheckpoint(
+      assignmentId,
+      checkpoint.roadmap_zone_id,
+      user.car_user_id || user.user_id,
+      skipReason,
+      skipCategory,
+      null,
+      user.tenant_id || 1
+    );
+    
+    setCompleting(false);
+    setShowSkipModal(false);
+    
+    if (result.success) {
+      Alert.alert(
+        '⏭️ Checkpoint Saltado',
+        'El checkpoint ha sido marcado como saltado.\n\nRequiere aprobación del supervisor.',
+        [
+          {
+            text: 'OK',
+            onPress: () => navigation.goBack()
+          }
+        ]
+      );
+    } else {
+      Alert.alert('Error', result.message || 'No se pudo saltar el checkpoint');
+    }
+  };
+
+  const getDistanceColor = () => {
+    if (!distance) return '#94A3B8';
+    if (distance <= 50) return '#10B981';
+    if (distance <= 100) return '#F59E0B';
+    return '#EF4444';
+  };
+
+  const getDistanceMessage = () => {
+    if (!distance) return 'Calculando...';
+    if (distance <= 50) return 'Muy cerca ✓';
+    if (distance <= 100) return 'Dentro del rango';
+    return 'Demasiado lejos';
+  };
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#0F172A" />
+      
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
+          <MaterialIcons name="arrow-back" size={24} color="#FFF" />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle}>Detalle del Checkpoint</Text>
+        <View style={styles.headerSpacer} />
+      </View>
+
+      <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
+        <View style={styles.checkpointCard}>
+          <View style={styles.checkpointHeader}>
+            <MaterialCommunityIcons name="map-marker" size={40} color="#8B5CF6" />
+            <View style={styles.checkpointInfo}>
+              <Text style={styles.checkpointName}>{checkpoint.zone_name}</Text>
+              <Text style={styles.checkpointCode}>{checkpoint.zone_code}</Text>
+            </View>
+          </View>
+
+          {checkpoint.description && (
+            <View style={styles.descriptionContainer}>
+              <Text style={styles.descriptionLabel}>Descripción:</Text>
+              <Text style={styles.descriptionText}>{checkpoint.description}</Text>
+            </View>
+          )}
+
+          <View style={styles.divider} />
+
+          <View style={styles.locationSection}>
+            <View style={styles.locationHeader}>
+              <MaterialIcons name="my-location" size={24} color="#3B82F6" />
+              <Text style={styles.locationTitle}>Tu Ubicación</Text>
+            </View>
+            
+            {!userLocation ? (
+              <View style={styles.loadingLocation}>
+                <ActivityIndicator size="small" color="#3B82F6" />
+                <Text style={styles.loadingText}>Obteniendo ubicación...</Text>
+              </View>
+            ) : (
+              <>
+                <View style={styles.distanceCard}>
+                  <Text style={styles.distanceLabel}>Distancia al checkpoint:</Text>
+                  <Text style={[styles.distanceValue, { color: getDistanceColor() }]}>
+                    {distance !== null ? `${distance} metros` : 'Calculando...'}
+                  </Text>
+                  <Text style={[styles.distanceMessage, { color: getDistanceColor() }]}>
+                    {getDistanceMessage()}
+                  </Text>
+                </View>
+
+                {distance && distance > 100 && (
+                  <View style={styles.warningCard}>
+                    <MaterialIcons name="warning" size={20} color="#F59E0B" />
+                    <Text style={styles.warningText}>
+                      Debes estar a menos de 100 metros para completar el checkpoint
+                    </Text>
+                  </View>
+                )}
+              </>
+            )}
+          </View>
+
+          <View style={styles.divider} />
+
+          <View style={styles.notesSection}>
+            <Text style={styles.notesLabel}>Notas (Opcional):</Text>
+            <TextInput
+              style={styles.notesInput}
+              placeholder="Agrega notas o comentarios..."
+              placeholderTextColor="#64748B"
+              value={notes}
+              onChangeText={setNotes}
+              multiline
+              numberOfLines={4}
+              maxLength={500}
+            />
+            <Text style={styles.notesCounter}>{notes.length}/500</Text>
+          </View>
+        </View>
+
+        {/* ✅ INSTRUCCIÓN CLARA */}
+        <View style={styles.instructionCard}>
+          <MaterialIcons name="info" size={24} color="#3B82F6" />
+          <View style={styles.instructionContent}>
+            <Text style={styles.instructionTitle}>¿Cómo completar?</Text>
+            <Text style={styles.instructionText}>
+              Escanea el código QR o tag NFC ubicado en este checkpoint para marcarlo como completado.
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.actionsContainer}>
+          {/* ✅ BOTÓN PRINCIPAL: ESCANEAR */}
+          <TouchableOpacity
+            style={[
+              styles.scanButton,
+              (!userLocation || completing) && styles.buttonDisabled
+            ]}
+            onPress={handleScanCheckpoint}
+            disabled={!userLocation || completing}
+          >
+            <MaterialCommunityIcons name="qrcode-scan" size={28} color="#FFF" />
+            <Text style={styles.scanButtonText}>Escanear Checkpoint</Text>
+          </TouchableOpacity>
+
+          {/* Botón secundario: Saltar */}
+          <TouchableOpacity
+            style={[styles.skipButton, completing && styles.buttonDisabled]}
+            onPress={() => setShowSkipModal(true)}
+            disabled={completing}
+          >
+            <MaterialIcons name="skip-next" size={24} color="#F59E0B" />
+            <Text style={styles.skipButtonText}>Saltar Checkpoint</Text>
+          </TouchableOpacity>
+        </View>
+      </ScrollView>
+
+      {/* Skip Modal */}
+      <Modal
+        visible={showSkipModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => !completing && setShowSkipModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Saltar Checkpoint</Text>
+              <TouchableOpacity
+                onPress={() => setShowSkipModal(false)}
+                disabled={completing}
+              >
+                <MaterialIcons name="close" size={24} color="#94A3B8" />
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.modalDescription}>
+              Indica la razón por la cual no puedes completar este checkpoint.
+              La solicitud será enviada al supervisor para aprobación.
+            </Text>
+
+            <View style={styles.categoryContainer}>
+              <Text style={styles.categoryLabel}>Categoría:</Text>
+              <View style={styles.categoryButtons}>
+                {[
+                  { value: 'access_denied', label: 'Acceso Denegado' },
+                  { value: 'area_closed', label: 'Área Cerrada' },
+                  { value: 'emergency', label: 'Emergencia' },
+                  { value: 'other', label: 'Otro' }
+                ].map((cat) => (
+                  <TouchableOpacity
+                    key={cat.value}
+                    style={[
+                      styles.categoryButton,
+                      skipCategory === cat.value && styles.categoryButtonActive
+                    ]}
+                    onPress={() => setSkipCategory(cat.value)}
+                  >
+                    <Text
+                      style={[
+                        styles.categoryButtonText,
+                        skipCategory === cat.value && styles.categoryButtonTextActive
+                      ]}
+                    >
+                      {cat.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+
+            <View style={styles.reasonContainer}>
+              <Text style={styles.reasonLabel}>
+                Razón (mínimo 20 caracteres):
+              </Text>
+              <TextInput
+                style={styles.reasonInput}
+                placeholder="Explica detalladamente por qué no puedes completar este checkpoint..."
+                placeholderTextColor="#64748B"
+                value={skipReason}
+                onChangeText={setSkipReason}
+                multiline
+                numberOfLines={5}
+                maxLength={500}
+              />
+              <Text style={[
+                styles.reasonCounter,
+                skipReason.length < 20 && skipReason.length > 0 && styles.reasonCounterError
+              ]}>
+                {skipReason.length}/500 
+                {skipReason.length < 20 && ' (mínimo 20)'}
+              </Text>
+            </View>
+
+            <TouchableOpacity
+              style={[
+                styles.confirmSkipButton,
+                (completing || skipReason.length < 20) && styles.buttonDisabled
+              ]}
+              onPress={handleSkipCheckpoint}
+              disabled={completing || skipReason.length < 20}
+            >
+              {completing ? (
+                <ActivityIndicator size="small" color="#FFF" />
+              ) : (
+                <Text style={styles.confirmSkipButtonText}>Confirmar y Saltar</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0F172A',
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: '#1E293B',
+    borderBottomWidth: 1,
+    borderBottomColor: '#334155',
+  },
+  backButton: {
+    padding: 8,
+  },
+  headerTitle: {
+    flex: 1,
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+    textAlign: 'center',
+  },
+  headerSpacer: {
+    width: 40,
+  },
+  content: {
+    flex: 1,
+    padding: 16,
+  },
+  checkpointCard: {
+    backgroundColor: '#1E293B',
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 16,
+  },
+  checkpointHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  checkpointInfo: {
+    marginLeft: 16,
+    flex: 1,
+  },
+  checkpointName: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+    marginBottom: 4,
+  },
+  checkpointCode: {
+    fontSize: 14,
+    color: '#94A3B8',
+  },
+  descriptionContainer: {
+    marginBottom: 16,
+  },
+  descriptionLabel: {
+    fontSize: 12,
+    color: '#94A3B8',
+    marginBottom: 6,
+  },
+  descriptionText: {
+    fontSize: 14,
+    color: '#CBD5E1',
+    lineHeight: 20,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: '#334155',
+    marginVertical: 16,
+  },
+  locationSection: {
+    marginBottom: 16,
+  },
+  locationHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  locationTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#FFFFFF',
+    marginLeft: 8,
+  },
+  loadingLocation: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 20,
+  },
+  loadingText: {
+    color: '#94A3B8',
+    marginLeft: 12,
+    fontSize: 14,
+  },
+  distanceCard: {
+    backgroundColor: '#0F172A',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+  },
+  distanceLabel: {
+    fontSize: 13,
+    color: '#94A3B8',
+    marginBottom: 8,
+  },
+  distanceValue: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    marginBottom: 4,
+  },
+  distanceMessage: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  warningCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+    borderWidth: 1,
+    borderColor: '#F59E0B',
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 12,
+  },
+  warningText: {
+    color: '#F59E0B',
+    fontSize: 13,
+    marginLeft: 8,
+    flex: 1,
+  },
+  notesSection: {
+    marginTop: 16,
+  },
+  notesLabel: {
+    fontSize: 14,
+    color: '#FFFFFF',
+    marginBottom: 8,
+    fontWeight: '600',
+  },
+  notesInput: {
+    backgroundColor: '#0F172A',
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 12,
+    padding: 12,
+    color: '#FFFFFF',
+    fontSize: 14,
+    textAlignVertical: 'top',
+    minHeight: 100,
+  },
+  notesCounter: {
+    fontSize: 12,
+    color: '#64748B',
+    textAlign: 'right',
+    marginTop: 4,
+  },
+  instructionCard: {
+    flexDirection: 'row',
+    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+    borderWidth: 1,
+    borderColor: '#3B82F6',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 16,
+  },
+  instructionContent: {
+    marginLeft: 12,
+    flex: 1,
+  },
+  instructionTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#3B82F6',
+    marginBottom: 4,
+  },
+  instructionText: {
+    fontSize: 12,
+    color: '#60A5FA',
+    lineHeight: 18,
+  },
+  actionsContainer: {
+    marginBottom: 32,
+  },
+  scanButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#8B5CF6',
+    paddingVertical: 18,
+    borderRadius: 12,
+    marginBottom: 12,
+  },
+  scanButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginLeft: 12,
+  },
+  skipButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+    borderWidth: 1,
+    borderColor: '#F59E0B',
+    paddingVertical: 16,
+    borderRadius: 12,
+  },
+  skipButtonText: {
+    color: '#F59E0B',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginLeft: 8,
+  },
+  buttonDisabled: {
+    opacity: 0.5,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    justifyContent: 'flex-end',
+  },
+  modalContent: {
+    backgroundColor: '#1E293B',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 24,
+    maxHeight: '80%',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+  },
+  modalDescription: {
+    fontSize: 14,
+    color: '#94A3B8',
+    lineHeight: 20,
+    marginBottom: 20,
+  },
+  categoryContainer: {
+    marginBottom: 20,
+  },
+  categoryLabel: {
+    fontSize: 14,
+    color: '#FFFFFF',
+    marginBottom: 10,
+    fontWeight: '600',
+  },
+  categoryButtons: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  categoryButton: {
+    backgroundColor: '#0F172A',
+    borderWidth: 1,
+    borderColor: '#334155',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+  },
+  categoryButtonActive: {
+    backgroundColor: '#F59E0B',
+    borderColor: '#F59E0B',
+  },
+  categoryButtonText: {
+    color: '#94A3B8',
+    fontSize: 13,
+  },
+  categoryButtonTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '600',
+  },
+  reasonContainer: {
+    marginBottom: 20,
+  },
+  reasonLabel: {
+    fontSize: 14,
+    color: '#FFFFFF',
+    marginBottom: 8,
+    fontWeight: '600',
+  },
+  reasonInput: {
+    backgroundColor: '#0F172A',
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 12,
+    padding: 12,
+    color: '#FFFFFF',
+    fontSize: 14,
+    textAlignVertical: 'top',
+    minHeight: 120,
+  },
+  reasonCounter: {
+    fontSize: 12,
+    color: '#64748B',
+    textAlign: 'right',
+    marginTop: 4,
+  },
+  reasonCounterError: {
+    color: '#EF4444',
+  },
+  confirmSkipButton: {
+    backgroundColor: '#F59E0B',
+    paddingVertical: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
+  confirmSkipButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+});
